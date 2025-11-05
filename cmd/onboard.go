@@ -79,7 +79,7 @@ var onboardCmd = &cobra.Command{
 		if deviceStatus == FDO_STATE_PRE_TO1 || (deviceStatus == FDO_STATE_IDLE && resale) {
 			return doOnboard()
 		} else if deviceStatus == FDO_STATE_IDLE {
-			fmt.Println("FDO in Idle State. Device Onboarding already completed")
+			slog.Info("FDO in Idle State. Device Onboarding already completed")
 		} else if deviceStatus == FDO_STATE_PRE_DI {
 			return fmt.Errorf("device has not been properly initialized: run device-init first")
 		} else {
@@ -152,12 +152,12 @@ func doOnboard() error {
 		AllowCredentialReuse: true,
 	})
 	if newDC == nil {
-		fmt.Println("Credential not updated")
+		slog.Info("Credential not updated")
 		return nil
 	}
 
 	// Store new credential
-	fmt.Println("FIDO Device Onboard Complete")
+	slog.Info("FIDO Device Onboard Complete")
 	return updateCred(*newDC, FDO_STATE_IDLE)
 }
 
@@ -168,13 +168,23 @@ func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, c
 		rvEntryDelay        time.Duration
 		newDC               *fdo.DeviceCredential
 	)
-	for {
-		for _, directive := range directives {
-			rvEntryDelay = directive.Delay
 
+	if len(directives) == 0 {
+		slog.Error("No rendezvous directives found in device credential")
+		return nil
+	}
+
+	// Infinite retry loop - device keeps trying until onboarding succeeds or context is canceled
+	// This implements the FDO spec requirement that devices continuously attempt onboarding
+	for {
+		// Try each rendezvous directive in sequence
+		for i, directive := range directives {
 			var to1d *cose.Sign1[protocol.To1d, []byte]
 			var to2URLs []string
+
+			// Process directive based on whether RV bypass is enabled
 			if !directive.Bypass {
+				// Normal flow: Contact Rendezvous server via TO1 to discover Owner address
 				for _, url := range directive.URLs {
 					var err error
 					to1d, err = fdo.TO1(context.TODO(), tls.TlsTransport(url.String(), nil, insecureTLS), conf.Cred, conf.Key, nil)
@@ -185,21 +195,21 @@ func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, c
 					break
 				}
 				if to1d == nil {
-					slog.Error("Error: TO1 failed")
+					slog.Error("TO1 failed")
 					if directive.Delay != 0 {
 						// A 25% plus or minus jitter is allowed by spec
 						select {
 						case <-ctx.Done():
 							slog.Error("Context done", "error", ctx.Err())
 							return nil
-						case <-time.After(rvEntryDelay):
+						case <-time.After(directive.Delay):
 						}
 					}
 					continue
 				}
 				for _, to2Addr := range to1d.Payload.Val.RV {
 					if to2Addr.DNSAddress == nil && to2Addr.IPAddress == nil {
-						slog.Error("Error: Both IP and DNS can't be null")
+						slog.Error("Both IP and DNS can't be null")
 						continue
 					}
 
@@ -210,7 +220,7 @@ func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, c
 					case protocol.HTTPSTransport:
 						scheme, port = "https://", "443"
 					default:
-						slog.Error("Error: Invalid transport protocol", "transport protocol", to2Addr.TransportProtocol)
+						slog.Error("Invalid transport protocol", "transport protocol", to2Addr.TransportProtocol)
 						continue
 					}
 					if to2Addr.Port != 0 {
@@ -230,35 +240,47 @@ func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, c
 					}
 				}
 			} else {
+				// RV bypass flow: Use Owner URLs directly from directive, skipping TO1
 				for _, url := range directive.URLs {
 					to2URLs = append(to2URLs, url.String())
 				}
 			}
 
+			// Validate we have TO2 URLs to attempt
 			if len(to2URLs) == 0 {
-				slog.Error("Error: No valid TO2 URLs found")
+				slog.Error("No valid TO2 URLs found")
 				continue
 			}
 
-			// Try TO2 on each address only once
+			// Attempt TO2 with each Owner URL in sequence
+			// Note: With RV bypass, to1d will be nil (Owner URLs come from directive)
 			for _, baseURL := range to2URLs {
 				var err error
-				newDC, err = transferOwnership2(tls.TlsTransport(baseURL, nil, insecureTLS), to1d, conf)
+				newDC, err = transferOwnership2(ctx, tls.TlsTransport(baseURL, nil, insecureTLS), to1d, conf)
 				if newDC != nil {
 					onboardingPerformed = true
 					break
 				}
-				slog.Error("Error: TO2 failed", "base URL", baseURL, "error", err)
-				continue
+				slog.Error("TO2 failed", "base URL", baseURL, "error", err)
 			}
-
 			if onboardingPerformed {
 				break
+			}
+			// Capture delay from the last directive to use before retrying all directives
+			// Per FDO spec v1.1 section 3.7: If RVDelaysec does not appear in the last entry,
+			// use a default delay of 120s ± random(30)
+			if i == len(directives)-1 {
+				rvEntryDelay = directive.Delay
+				if rvEntryDelay == 0 {
+					rvEntryDelay = 120 * time.Second
+				}
 			}
 		}
 		if onboardingPerformed {
 			break
 		} else {
+			// All directives failed - wait before retrying from the beginning
+			// rvEntryDelay is set to the last directive's delay, or 120s default if not configured
 			if rvEntryDelay != 0 {
 				// A 25% plus or minus jitter is allowed by spec
 				select {
@@ -274,7 +296,7 @@ func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, c
 	return newDC
 }
 
-func transferOwnership2(transport fdo.Transport, to1d *cose.Sign1[protocol.To1d, []byte], conf fdo.TO2Config) (*fdo.DeviceCredential, error) {
+func transferOwnership2(ctx context.Context, transport fdo.Transport, to1d *cose.Sign1[protocol.To1d, []byte], conf fdo.TO2Config) (*fdo.DeviceCredential, error) {
 	fsims := map[string]serviceinfo.DeviceModule{
 		"fido_alliance": &fsim.Interop{},
 	}
