@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -134,7 +135,7 @@ func doOnboard() error {
 		slog.Warn("Setting serviceinfo.Devmod.Device", "error", err, "default", deviceName)
 	}
 
-	newDC := transferOwnership(clientContext, dc.RvInfo, fdo.TO2Config{
+	newDC, err := transferOwnership(clientContext, dc.RvInfo, fdo.TO2Config{
 		Cred:       *dc,
 		HmacSha256: hmacSha256,
 		HmacSha384: hmacSha384,
@@ -151,6 +152,12 @@ func doOnboard() error {
 		CipherSuite:          kexCipherSuiteID,
 		AllowCredentialReuse: true,
 	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
 	if newDC == nil {
 		slog.Info("Credential not updated")
 		return nil
@@ -161,7 +168,7 @@ func doOnboard() error {
 	return updateCred(*newDC, FDO_STATE_IDLE)
 }
 
-func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, conf fdo.TO2Config) *fdo.DeviceCredential { //nolint:gocyclo
+func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, conf fdo.TO2Config) (*fdo.DeviceCredential, error) { //nolint:gocyclo
 	var (
 		directives          = protocol.ParseDeviceRvInfo(rvInfo)
 		onboardingPerformed bool
@@ -170,8 +177,7 @@ func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, c
 	)
 
 	if len(directives) == 0 {
-		slog.Error("No rendezvous directives found in device credential")
-		return nil
+		return nil, errors.New("no rendezvous information found that's usable for the device")
 	}
 
 	// Infinite retry loop - device keeps trying until onboarding succeeds or context is canceled
@@ -187,7 +193,7 @@ func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, c
 				// Normal flow: Contact Rendezvous server via TO1 to discover Owner address
 				for _, url := range directive.URLs {
 					var err error
-					to1d, err = fdo.TO1(context.TODO(), tls.TlsTransport(url.String(), nil, insecureTLS), conf.Cred, conf.Key, nil)
+					to1d, err = fdo.TO1(ctx, tls.TlsTransport(url.String(), nil, insecureTLS), conf.Cred, conf.Key, nil)
 					if err != nil {
 						slog.Error("TO1 failed", "base URL", url.String(), "error", err)
 						continue
@@ -200,8 +206,8 @@ func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, c
 						// A 25% plus or minus jitter is allowed by spec
 						select {
 						case <-ctx.Done():
-							slog.Error("Context done", "error", ctx.Err())
-							return nil
+							slog.Info("Onboarding canceled by user")
+							return nil, ctx.Err()
 						case <-time.After(directive.Delay):
 						}
 					}
@@ -283,17 +289,21 @@ func transferOwnership(ctx context.Context, rvInfo [][]protocol.RvInstruction, c
 			// rvEntryDelay is set to the last directive's delay, or 120s default if not configured
 			if rvEntryDelay != 0 {
 				// A 25% plus or minus jitter is allowed by spec
-				select {
-				case <-ctx.Done():
-					slog.Error("Context done", "error", ctx.Err())
-					return nil
-				case <-time.After(rvEntryDelay):
+				if ctx != nil {
+					select {
+					case <-ctx.Done():
+						slog.Info("Onboarding canceled by user")
+						return nil, ctx.Err()
+					case <-time.After(rvEntryDelay):
+					}
+				} else {
+					time.Sleep(rvEntryDelay)
 				}
 			}
 		}
 	}
 
-	return newDC
+	return newDC, nil
 }
 
 func transferOwnership2(ctx context.Context, transport fdo.Transport, to1d *cose.Sign1[protocol.To1d, []byte], conf fdo.TO2Config) (*fdo.DeviceCredential, error) {
@@ -356,7 +366,7 @@ func transferOwnership2(ctx context.Context, transport fdo.Transport, to1d *cose
 	}
 	conf.DeviceModules = fsims
 
-	return fdo.TO2(context.TODO(), transport, to1d, conf)
+	return fdo.TO2(ctx, transport, to1d, conf)
 }
 
 // Function to validate if a string is a valid IP address
