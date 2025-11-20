@@ -201,14 +201,10 @@ curl --fail --silent --show-error \
 }
 info "Ownership voucher uploaded to Owner"
 
-# Trigger TO0 (Owner registers with Rendezvous)
-info "Triggering TO0 protocol (Owner registers with Rendezvous)..."
-curl --fail --silent --show-error \
-     "http://127.0.0.1:8043/api/v1/to0/${GUID}" || {
-    error "Failed to trigger TO0"
-    exit 1
-}
-info "TO0 protocol completed successfully"
+# Wait for automatic TO0 (Owner automatically registers with Rendezvous)
+info "Waiting for automatic TO0 to complete..."
+sleep 20
+info "Proceeding to device onboarding"
 
 # Run device onboarding (TO1 + TO2)
 info "Running device onboarding (TO1 + TO2)..."

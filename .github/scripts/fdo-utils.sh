@@ -151,12 +151,6 @@ send_ov_to_owner () {
   curl --fail --verbose --silent "http://${owner_service}/api/v1/owner/vouchers" --data-binary "@${output}"
 }
 
-run_to0 () {
-  local owner_service=$1
-  local guid=$2
-  curl --fail --verbose --silent "http://${owner_service}/api/v1/to0/${guid}"
-}
-
 run_fido_device_onboard () {
   local log=$1
   go-fdo-client --blob "${device_credentials}" --debug onboard --key ec256 --kex ECDH256 | tee "${log}"
@@ -172,6 +166,7 @@ test_onboarding () {
   get_ov_from_manufacturer ${manufacturer_service} "${guid}" ${owner_ov}
   set_owner_redirect_info ${owner_service} ${owner_ip} ${owner_port}
   send_ov_to_owner ${owner_service} ${owner_ov}
-  run_to0 ${owner_service} "${guid}"
+  echo "Sleeping to allow automatic TO0 to complete..."
+  sleep 20
   run_fido_device_onboard ${owner_onboard_log}
 }
